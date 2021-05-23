@@ -12,6 +12,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ import (
 
 const (
 	avatarMaxBytes = 1 * 1024 * 1024
+	avatarFilePath = "/home/isucon/isubata/icons/%s"
 )
 
 var (
@@ -120,13 +122,6 @@ type Message struct {
 	UserID    int64     `db:"user_id"`
 	Content   string    `db:"content"`
 	CreatedAt time.Time `db:"created_at"`
-}
-
-func queryMessages(chanID, lastID int64) ([]Message, error) {
-	msgs := []Message{}
-	err := db.Select(&msgs, "SELECT * FROM message WHERE id > ? AND channel_id = ? ORDER BY id DESC LIMIT 100",
-		lastID, chanID)
-	return msgs, err
 }
 
 func sessUserID(c echo.Context) int64 {
@@ -350,6 +345,15 @@ func postMessage(c echo.Context) error {
 	return c.NoContent(204)
 }
 
+type MessageWithUser struct {
+	ID              int64     `db:"id"`
+	Content         string    `db:"content"`
+	CreatedAt       time.Time `db:"created_at"`
+	UserName        string    `db:"name"`
+	UserDisplayName string    `db:"display_name"`
+	UserAvatarIcon  string    `db:"avatar_icon"`
+}
+
 func jsonifyMessage(m Message) (map[string]interface{}, error) {
 	u := User{}
 	err := db.Get(&u, "SELECT name, display_name, avatar_icon FROM user WHERE id = ?",
@@ -364,6 +368,13 @@ func jsonifyMessage(m Message) (map[string]interface{}, error) {
 	r["date"] = m.CreatedAt.Format("2006/01/02 15:04:05")
 	r["content"] = m.Content
 	return r, nil
+}
+
+func queryMessageWithUser(chanID, lastID int64) ([]MessageWithUser, error) {
+	msgs := []MessageWithUser{}
+	err := db.Select(&msgs, "select m.id, m.content, m.created_at, u.name, u.display_name, u.avatar_icon from message m inner join user u on u.id = m.user_id where m.id > ? and m.channel_id = ? order by m.id desc limit 100",
+		lastID, chanID)
+	return msgs, err
 }
 
 func getMessage(c echo.Context) error {
@@ -381,7 +392,7 @@ func getMessage(c echo.Context) error {
 		return err
 	}
 
-	messages, err := queryMessages(chanID, lastID)
+	messages, err := queryMessageWithUser(chanID, lastID)
 	if err != nil {
 		return err
 	}
@@ -389,10 +400,15 @@ func getMessage(c echo.Context) error {
 	response := make([]map[string]interface{}, 0)
 	for i := len(messages) - 1; i >= 0; i-- {
 		m := messages[i]
-		r, err := jsonifyMessage(m)
-		if err != nil {
-			return err
+		r := make(map[string]interface{})
+		r["id"] = m.ID
+		r["user"] = User{
+			Name:        m.UserName,
+			DisplayName: m.UserDisplayName,
+			AvatarIcon:  m.UserAvatarIcon,
 		}
+		r["date"] = m.CreatedAt.Format("2006/01/02 15:04:05")
+		r["content"] = m.Content
 		response = append(response, r)
 	}
 
@@ -442,7 +458,7 @@ func fetchUnread(c echo.Context) error {
 		return c.NoContent(http.StatusForbidden)
 	}
 
-	time.Sleep(time.Second)
+	// time.Sleep(time.Second)
 
 	channels, err := queryChannels()
 	if err != nil {
@@ -662,10 +678,17 @@ func postProfile(c echo.Context) error {
 	}
 
 	if avatarName != "" && len(avatarData) > 0 {
-		_, err := db.Exec("INSERT INTO image (name, data) VALUES (?, ?)", avatarName, avatarData)
+		avFile, err := os.Create(fmt.Sprintf(avatarFilePath, avatarName))
 		if err != nil {
 			return err
 		}
+		defer avFile.Close()
+
+		_, err = avFile.Write(avatarData)
+		if err != nil {
+			return err
+		}
+
 		_, err = db.Exec("UPDATE user SET avatar_icon = ? WHERE id = ?", avatarName, self.ID)
 		if err != nil {
 			return err
@@ -683,14 +706,20 @@ func postProfile(c echo.Context) error {
 }
 
 func getIcon(c echo.Context) error {
-	var name string
 	var data []byte
-	err := db.QueryRow("SELECT name, data FROM image WHERE name = ?",
-		c.Param("file_name")).Scan(&name, &data)
-	if err == sql.ErrNoRows {
-		return echo.ErrNotFound
-	}
+	name := c.Param("file_name")
+
+	log.Println(fmt.Sprintf(avatarFilePath, name))
+	file, err := os.Open(fmt.Sprintf(avatarFilePath, name))
 	if err != nil {
+		log.Println("Open Err")
+		return err
+	}
+	defer file.Close()
+
+	data, err = ioutil.ReadAll(file)
+	if err != nil {
+		log.Println("Read Err")
 		return err
 	}
 
@@ -703,6 +732,7 @@ func getIcon(c echo.Context) error {
 	case strings.HasSuffix(name, ".gif"):
 		mime = "image/gif"
 	default:
+		log.Println("Suffix Err")
 		return echo.ErrNotFound
 	}
 	return c.Blob(http.StatusOK, mime, data)
@@ -720,8 +750,69 @@ func tRange(a, b int64) []int64 {
 	return r
 }
 
+func dlIcons(c echo.Context) error {
+	var names []string
+
+	rows, err := db.Query("SELECT name FROM image GROUP BY name")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	go func() {
+
+		for _, v := range names {
+			var name string
+			var data []byte
+			err = db.QueryRow("SELECT name, data FROM image WHERE name = ?", v).Scan(&name, &data)
+			if err == sql.ErrNoRows {
+				log.Println("Not Found")
+			}
+			if err != nil {
+				log.Println("dl err")
+			}
+			_, err := os.Stat(fmt.Sprintf(avatarFilePath, v))
+			if os.IsNotExist(err) {
+				avFile, err := os.OpenFile(fmt.Sprintf(avatarFilePath, v), os.O_WRONLY|os.O_CREATE, 0777)
+				if err != nil {
+					log.Println("dl err")
+				}
+				defer avFile.Close()
+
+				_, err = avFile.Write(data)
+				if err != nil {
+					log.Println("dl err")
+				}
+			}
+			log.Println("dl end" + v)
+		}
+		log.Println("dl end")
+	}()
+
+	return c.JSON(http.StatusOK, "OK")
+}
+
 func main() {
+
 	e := echo.New()
+
+	// pprof
+	pprofGroup := e.Group("/debug/pprof")
+	pprofGroup.Any("/cmdline", echo.WrapHandler(http.HandlerFunc(pprof.Cmdline)))
+	pprofGroup.Any("/profile", echo.WrapHandler(http.HandlerFunc(pprof.Profile)))
+	pprofGroup.Any("/symbol", echo.WrapHandler(http.HandlerFunc(pprof.Symbol)))
+	pprofGroup.Any("/trace", echo.WrapHandler(http.HandlerFunc(pprof.Trace)))
+	pprofGroup.Any("/*", echo.WrapHandler(http.HandlerFunc(pprof.Index)))
+
 	funcs := template.FuncMap{
 		"add":    tAdd,
 		"xrange": tRange,
@@ -755,6 +846,7 @@ func main() {
 	e.GET("add_channel", getAddChannel)
 	e.POST("add_channel", postAddChannel)
 	e.GET("/icons/:file_name", getIcon)
+	e.GET("/dl_icons", dlIcons)
 
 	e.Start(":5000")
 }

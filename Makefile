@@ -17,7 +17,7 @@ DOCKER_EXEC := $(DOCKER) exec -it
 # ==========================
 
 up: ## buildからup、nginxとmysqlの起動までを全て行う
-	$(DOCKER_COMPOSE) up -d
+	$(DOCKER_COMPOSE) up -d --build
 	$(MAKE) nginx/start
 	$(MAKE) mysql/start
 
